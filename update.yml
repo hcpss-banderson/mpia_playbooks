@@ -1,0 +1,153 @@
+---
+- name: "Update the MPIA site"
+  hosts: all
+  become: yes
+
+  vars:
+    docker_pass: fake
+    project: mpia
+    projects:
+      mpia:
+        name: mpia
+        port: 8083
+      ieq:
+        name: ieq
+        port: 8084
+
+  roles:
+    - geerlingguy.git
+
+  tasks:
+    - set_fact:
+        project_name: "{{ projects[project].name }}"
+        project_port: "{{ projects[project].port }}"
+
+    - name: "Set up git ssh"
+      community.general.ssh_config:
+        host: "github.com"
+        hostname: "github.com"
+        identity_file: "/home/vagrant/ssh/id_rsa"
+        state: present
+
+    - name: "Clone the repo"
+      git:
+        repo: git@github.com:HCPSS/mpia.hcpss.org.git
+        dest: "/srv/updates/{{ project_name }}"
+        update: yes
+        force: yes
+        accept_hostkey: yes
+        key_file: /home/vagrant/ssh/id_rsa
+
+    - name: "Make sure the containers are not running"
+      community.docker.docker_compose:
+        project_src: "/srv/updates/{{ project_name }}"
+        state: absent
+
+    - name: "Initialize"
+      command: ./bin/init
+      args:
+        chdir: "/srv/updates/{{ project_name }}"
+        creates: "/srv/updates/{{ project_name }}/.env"
+
+    - name: "Log in to reg"
+      community.docker.docker_login:
+        registry_url: reg.hcpss.org
+        username: banderson
+        password: "{{ docker_pass }}"
+
+    - name: "Launch the containers"
+      community.docker.docker_compose:
+        project_src: "/srv/updates/{{ project_name }}"
+        pull: yes
+
+    - name: wait_for http
+      command: "curl -I http://{{ project_name }}.hcpss.localhost:{{ project_port }}"
+      register: result
+      until: result.stdout.find("200 OK") != -1
+      retries: 60
+      delay: 5
+      changed_when: false
+
+    - name: "Run composer updates"
+      community.docker.docker_container_exec:
+        container: "{{ project_name }}_web"
+        command: composer update
+      register: composer_result
+
+    - name: "Make sure we have updates"
+      assert:
+        that: composer_result.stderr.find("Nothing to modify in lock file") == -1
+        fail_msg: "Composer did not find any updates"
+        success_msg: "Composer found updates"
+
+    - name: "Run drupal updates"
+      community.docker.docker_container_exec:
+        container: "{{ project_name }}_web"
+        command: drush updb -y
+
+    - name: "Confirm updates"
+      pause:
+        prompt: "Everything look OK: http://{{ project_name }}.hcpss.localhost:{{ project_port }} ?"
+
+    - name: "Export Drupal config"
+      community.docker.docker_container_exec:
+        container: "{{ project_name }}_web"
+        command: drush cex -y
+
+    - name: "Find the current version of the docker container"
+      slurp:
+        src: "/srv/updates/{{ project_name }}/docker-compose.yml"
+      register: slurped
+
+    - set_fact:
+        old_version: "{{ slurped['content'] | b64decode | regex_search('reg.hcpss.org/' ~ project_name ~ '/web:(\\d*)\\.(\\d*)\\.(\\d*)') | split(':') | last }}"
+
+    - debug:
+        var: old_version
+
+    - set_fact:
+        old_version_pieces: "{{ old_version | split('.') }}"
+
+    - set_fact:
+        new_version: "{{ old_version_pieces[0] }}.{{ old_version_pieces[1] }}.{{ old_version_pieces[2] | int + 1 }}"
+
+    - name: "Replace old version with new in docker-compose.yml and Dockerfile"
+      ansible.builtin.replace:
+        path: "{{ item.path }}"
+        regexp: "{{ item.find }}"
+        replace: "{{ item.replace }}"
+      with_items:
+        - path: /srv/updates/{{ project_name }}/docker-compose.yml
+          find: 'reg.hcpss.org/{{ project_name }}/web:(\d*).(\d*).(\d*)'
+          replace: 'reg.hcpss.org/{{ project_name }}/web:{{ new_version }}'
+        - path: /srv/updates/{{ project_name }}/docker/web/Dockerfile
+          find: 'org.hcpss.{{ project_name }}.version="(\d*).(\d*).(\d*)"'
+          replace: 'org.hcpss.{{ project_name }}.version="{{ new_version }}"'
+
+    - name: "Configure git"
+      command: 'git config user.{{ item.key }} "{{ item.value }}"'
+      args:
+        chdir: "/srv/updates/{{ project_name }}"
+      with_items:
+        - { key: email, value: brendan_anderson@hcpss.org }
+        - { key: name, value: "Brendan Anderson" }
+
+    - name: "Commit the changes"
+      command: git commit -am "Core update"
+      args:
+        chdir: "/srv/updates/{{ project_name }}"
+
+    - name: "Push the changes"
+      command: git push origin master
+      args:
+        chdir: "/srv/updates/{{ project_name }}"
+
+    - name: "Rebuild image(s)"
+      community.docker.docker_compose:
+        project_src: "/srv/updates/{{ project_name }}"
+        build: yes
+
+    - name: "Push images"
+      command: docker-compose push
+      args:
+        chdir: "/srv/updates/{{ project_name }}"

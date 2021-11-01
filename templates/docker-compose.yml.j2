@@ -1,0 +1,40 @@
+---
+version: '2'
+
+services:
+  db:
+    container_name: {{ project }}_db
+    image: mysql:5.7
+    restart: always
+    volumes:
+      - ./.data:/var/lib/mysql
+      - ./log/mysql:/var/log/mysql
+      - ./drupal.sql:/docker-entrypoint-initdb.d/drupal.sql
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+      MYSQL_DATABASE: ${MYSQL_DATABASE}
+      MYSQL_USER: ${MYSQL_USER}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+    command: --max-allowed-packet=128M
+
+  drupal:
+    container_name: {{ project }}_web
+    depends_on:
+      - db
+    image: reg.hcpss.org/{{ project }}/web:{{ deploy_version }}
+    restart: always
+    ports:
+      - {{ deploy_port }}:80
+    volumes:
+      - ./private_files:/var/www/drupal/files
+      - ./public_files:/var/www/drupal/web/sites/default/files
+      - ./log/apache2:/var/log/apache2
+      - ./log/mail.log:/var/log/mail.log
+    environment:
+      MYSQL_DATABASE: ${MYSQL_DATABASE}
+      MYSQL_USER: ${MYSQL_USER}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+      MYSQL_PORT: ${MYSQL_PORT}
+      MYSQL_HOSTNAME: db
+      DRUPAL_ENV: prod
+      CLEANTALK_AUTH_KEY: ${CLEANTALK_AUTH_KEY}
